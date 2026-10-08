@@ -224,26 +224,10 @@ impl App {
         });
     }
 
-    /// Updates channels and names after contacts were synchronized from the primary device
+    /// Refreshes names after contacts were synchronized from the primary device
+    ///
+    /// Names of users without a channel are resolved lazily from the contacts store.
     pub async fn on_contacts_synced(&mut self) {
-        for contact in self.signal_manager.contacts().await {
-            let name = contact.name.trim();
-            if name.is_empty() {
-                continue;
-            }
-            let channel_id = ChannelId::User(contact.uuid);
-            if self.channel(channel_id).is_none() {
-                self.store_channel(Channel {
-                    id: channel_id,
-                    name: name.to_owned(),
-                    group_data: None,
-                    unread_messages: 0,
-                    muted: false,
-                    typing: TypingSet::new(false),
-                    expire_timer: None,
-                });
-            }
-        }
         self.populate_names_cache().await;
     }
 
@@ -831,19 +815,32 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_on_contacts_synced() {
-        let contact_id = Uuid::new_v4();
+        let known_id = Uuid::new_v4();
+        let unknown_id = Uuid::new_v4();
         let signal_manager = SignalManagerMock::new();
         let contacts = signal_manager.contacts.clone();
         let (mut app, _events, _) = test_app_with(signal_manager).await;
-        assert_eq!(app.name_by_id_cached(contact_id), contact_id.to_string());
+        app.store_channel(Channel {
+            id: ChannelId::User(known_id),
+            name: known_id.to_string(),
+            group_data: None,
+            unread_messages: 0,
+            muted: false,
+            typing: TypingSet::SingleTyping(None),
+            expire_timer: None,
+        });
+        let num_channels = app.channels().len();
+        assert_eq!(app.name_by_id_cached(known_id), known_id.to_string());
 
-        contacts
-            .borrow_mut()
-            .push((contact_id, "Robert Paulson".to_string()));
+        contacts.borrow_mut().extend([
+            (known_id, "Robert Paulson".to_string()),
+            (unknown_id, "Marla Singer".to_string()),
+        ]);
         app.on_contacts_synced().await;
 
-        assert!(app.channel(ChannelId::User(contact_id)).is_some());
-        assert_eq!(app.name_by_id_cached(contact_id), "Robert Paulson");
+        assert_eq!(app.channels().len(), num_channels);
+        assert_eq!(app.name_by_id_cached(known_id), "Robert Paulson");
+        assert_eq!(app.name_by_id(unknown_id).await, "Marla Singer");
     }
 
     #[test]

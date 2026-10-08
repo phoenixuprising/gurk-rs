@@ -39,7 +39,7 @@ const FRAME_BUDGET: Duration = Duration::from_millis(1000 / TARGET_FPS);
 const SAVE_BUDGET: Duration = Duration::from_millis(1000);
 const RECEIPT_BUDGET: Duration = Duration::from_millis(RECEIPT_TICK_PERIOD * 1000 / TARGET_FPS);
 /// Minimum time between two contacts sync requests (if there are already some contacts)
-const CONTACTS_SYNC_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+const CONTACTS_SYNC_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::days(1);
 const CONTACTS_SYNC_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Parser)]
