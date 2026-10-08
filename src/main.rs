@@ -260,7 +260,7 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
     let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
 
-    let backend = CrosstermBackend::new(stdout);
+    let backend = ui::WidthSafeBackend::new(CrosstermBackend::new(stdout));
     let mut terminal = Terminal::new(backend)?;
     // Clear before spawning the event reader: Terminal::clear queries the cursor position (ESC[6n)
     // and reads the reply back from stdin. Spawned event reader consumes that reply and the query

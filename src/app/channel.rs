@@ -383,6 +383,8 @@ impl App {
             None => window.load_tail(&*self.storage, PAGE),
         }
         self.window = Some(window);
+        // redraw everything to remove leftovers from glyphs rendered with unexpected widths
+        self.should_clear = true;
 
         self.channel_selected_at = std::time::Instant::now();
         self.timers_activated_for = None;

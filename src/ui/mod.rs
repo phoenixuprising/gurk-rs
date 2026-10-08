@@ -2,9 +2,13 @@
 //!
 //! Also contains helpers for computing coordinates (for clicking)
 
+mod backend;
 mod coords;
 mod draw;
 mod name_resolver;
+mod sanitize;
+
+pub use backend::WidthSafeBackend;
 
 pub use coords::coords_within_channels_view;
 pub use draw::draw;

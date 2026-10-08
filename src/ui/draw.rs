@@ -29,6 +29,7 @@ use crate::util::utc_timestamp_msec_to_local;
 
 use super::CHANNEL_VIEW_RATIO;
 use super::name_resolver::NameResolver;
+use super::sanitize::{sanitize, sanitize_owned};
 
 /// The main function drawing the UI for each frame
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -539,9 +540,10 @@ fn display_message(
     );
 
     let (from, from_color) = names.resolve(msg.from_id);
+    let from = sanitize(&from).into_owned();
 
     let from_width = from.width();
-    let from = Span::styled(from.into_owned(), Style::default().fg(from_color));
+    let from = Span::styled(from, Style::default().fg(from_color));
     let delimiter = Span::from(": ");
 
     // collect message text
@@ -559,6 +561,7 @@ fn display_message(
         text
     };
     add_expire_countdown(msg, &mut text);
+    let text = sanitize_owned(text);
 
     let mut spans: Vec<Line> = vec![];
     if let Some(date_division) = date_division {
@@ -572,7 +575,8 @@ fn display_message(
     let quote_text = msg
         .quote
         .as_ref()
-        .and_then(|quote| displayed_quote(names, quote));
+        .and_then(|quote| displayed_quote(names, quote))
+        .map(sanitize_owned);
     if let Some(quote_text) = quote_text.as_ref() {
         let quote_prefix = format!("{prefix}> ");
         let quote_wrap_opts = textwrap::Options::new(width.saturating_sub(2))
