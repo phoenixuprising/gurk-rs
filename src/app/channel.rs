@@ -208,25 +208,20 @@ impl App {
                     && Uuid::parse_str(name) != Ok(uuid)
             })
             .is_some();
-        if !is_known {
-            let name = if let Some(name) = self.signal_manager.profile_name(uuid).await {
-                name
-            } else {
-                match profile_key {
-                    Some(profile_key) => {
-                        // try to resolve from signal service via their profile
-                        self.signal_manager
-                            .resolve_profile_name(uuid, profile_key)
-                            .await
-                            .unwrap_or_else(|| uuid.to_string())
-                    }
-                    None => {
-                        // cannot be resolved
-                        uuid.to_string()
-                    }
+        if is_known {
+            return;
+        }
+        match self.resolve_name(uuid).await {
+            Some(name) if !util::is_phone_number(&name) => {
+                self.storage.store_name(uuid, &name);
+                self.cache_name(uuid, name);
+            }
+            _ => {
+                if let Some(profile_key) = profile_key {
+                    // try to resolve from signal service via their profile in the background
+                    self.request_profile_names(vec![(uuid, profile_key)]);
                 }
-            };
-            self.storage.store_name(uuid, &name);
+            }
         }
     }
 
@@ -234,7 +229,6 @@ impl App {
         &mut self,
         users_with_keys: impl Iterator<Item = (Uuid, ProfileKeyBytes)>,
     ) {
-        // TODO: Run in parallel
         for (uuid, profile_key) in users_with_keys {
             self.ensure_user_is_known(uuid, Some(profile_key)).await;
         }

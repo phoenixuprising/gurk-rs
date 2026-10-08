@@ -4,6 +4,7 @@ use std::{path::PathBuf, pin::Pin};
 
 use anyhow::Context;
 use async_trait::async_trait;
+use presage::libsignal_service::content::ContentBody;
 use presage::libsignal_service::prelude::ProfileKey;
 use presage::libsignal_service::protocol::ServiceId;
 use presage::libsignal_service::sender::AttachmentSpec;
@@ -15,15 +16,11 @@ use presage::proto::{
     AttachmentPointer, DataMessage, EditMessage, GroupContextV2, ReceiptMessage, SyncMessage,
 };
 use presage::store::ContentsStore;
-use presage::{
-    libsignal_service::content::{Content, ContentBody},
-    model::messages::Received,
-};
 use presage_store_sqlite::SqliteStore;
 use sha2::Digest;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::{Stream, StreamExt};
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::data::{Channel, ChannelId, GroupData, Message};
@@ -31,8 +28,8 @@ use crate::receipt::Receipt;
 use crate::util::utc_now_timestamp_msec;
 
 use super::{
-    Attachment, GroupMasterKeyBytes, LocalPool, ProfileKeyBytes, ResolvedGroup, SignalManager,
-    attachment,
+    Attachment, GroupMasterKeyBytes, LocalPool, ProfileKeyBytes, Received, ResolvedGroup,
+    SignalManager, attachment,
 };
 
 pub(super) struct PresageManager {
@@ -424,22 +421,48 @@ impl SignalManager for PresageManager {
         });
     }
 
-    async fn resolve_profile_name(
-        &mut self,
-        id: Uuid,
-        profile_key: ProfileKeyBytes,
-    ) -> Option<String> {
-        match self
-            .manager
-            .retrieve_profile_by_uuid(id, ProfileKey::create(profile_key))
-            .await
-        {
-            Ok(profile) => Some(profile.name?.given_name),
-            Err(e) => {
-                error!("failed to retrieve user profile: {}", e);
-                None
+    fn resolve_profile_names(
+        &self,
+        profiles: Vec<(Uuid, ProfileKeyBytes)>,
+    ) -> mpsc::UnboundedReceiver<(Uuid, String)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut manager = self.manager.clone();
+        self.local_pool.spawn(move || async move {
+            for (id, profile_key) in profiles {
+                match manager
+                    .retrieve_profile_by_uuid(id, ProfileKey::create(profile_key))
+                    .await
+                {
+                    Ok(profile) => {
+                        let Some(name) = profile
+                            .name
+                            .map(|name| name.given_name)
+                            .filter(|name| !name.trim().is_empty())
+                        else {
+                            debug!(%id, "retrieved user profile without name");
+                            continue;
+                        };
+                        if tx.send((id, name)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%id, %error, "failed to retrieve user profile");
+                    }
+                }
             }
-        }
+        });
+        rx
+    }
+
+    async fn profile_key(&self, id: Uuid) -> Option<ProfileKeyBytes> {
+        let service_id = ServiceId::Aci(id.into());
+        let profile_key = self.manager.store().profile_key(&service_id).await.ok()??;
+        Some(profile_key.get_bytes())
+    }
+
+    async fn request_contacts_sync(&self) -> anyhow::Result<()> {
+        Ok(self.manager.clone().request_contacts().await?)
     }
 
     async fn profile_name(&self, id: Uuid) -> Option<String> {
@@ -459,19 +482,18 @@ impl SignalManager for PresageManager {
         self.manager.store().contact_by_id(&id).await.ok()?
     }
 
-    async fn receive_messages(
-        &mut self,
-    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Box<Content>>>>> {
+    async fn receive_messages(&mut self) -> anyhow::Result<Pin<Box<dyn Stream<Item = Received>>>> {
         Ok(Box::pin(self.manager.receive_messages().await?.filter_map(
             |received| match received {
-                Received::Content(content) => Some(content),
-                Received::QueueEmpty => None,
-                Received::Contacts => {
-                    // TODO: <https://github.com/boxdot/gurk-rs/issues/349>
-                    warn!("Received contacts, but not implemented yet");
-                    None
+                presage::model::messages::Received::Content(content) => {
+                    Some(Received::Content(content))
                 }
-                Received::DecryptionError(service_id) => {
+                presage::model::messages::Received::QueueEmpty => None,
+                presage::model::messages::Received::Contacts => {
+                    info!("received contacts from primary device");
+                    Some(Received::Contacts)
+                }
+                presage::model::messages::Received::DecryptionError(service_id) => {
                     error!(?service_id, "Received decryption error");
                     None
                 }

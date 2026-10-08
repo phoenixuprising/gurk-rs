@@ -1,15 +1,16 @@
 use std::pin::Pin;
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use async_trait::async_trait;
-use presage::libsignal_service::content::Content;
+use presage::libsignal_service::groups_v2::Role;
 use presage::libsignal_service::prelude::AttachmentIdentifier;
+use presage::libsignal_service::prelude::ProfileKey;
 use presage::libsignal_service::sender::AttachmentSpec;
 use presage::model::contacts::Contact;
-use presage::model::groups::Group;
+use presage::model::groups::{Group, Member};
 use presage::proto::AttachmentPointer;
 use presage::proto::data_message::Quote;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::Stream;
 use uuid::Uuid;
 
@@ -17,12 +18,25 @@ use crate::data::{Channel, GroupData, Message};
 use crate::receipt::Receipt;
 use crate::util::utc_now_timestamp_msec;
 
-use super::{Attachment, GroupMasterKeyBytes, ProfileKeyBytes, ResolvedGroup, SignalManager};
+use super::{
+    Attachment, GroupMasterKeyBytes, ProfileKeyBytes, Received, ResolvedGroup, SignalManager,
+};
+
+/// Members of a group with their profile keys
+type GroupMembers = Vec<(Uuid, ProfileKeyBytes)>;
 
 /// Signal manager mock which does not send any messages.
 pub struct SignalManagerMock {
     user_id: Uuid,
     pub sent_messages: Rc<RefCell<Vec<Message>>>,
+    /// Names returned by profile resolution
+    pub profile_names: Rc<RefCell<HashMap<Uuid, String>>>,
+    /// Ids for which profile resolution was requested
+    pub profile_requests: Rc<RefCell<Vec<Uuid>>>,
+    /// Contacts in the signal storage
+    pub contacts: Rc<RefCell<Vec<(Uuid, String)>>>,
+    /// Groups in the signal storage
+    pub groups: Rc<RefCell<Vec<(GroupMasterKeyBytes, GroupMembers)>>>,
 }
 
 impl SignalManagerMock {
@@ -30,6 +44,10 @@ impl SignalManagerMock {
         Self {
             user_id: Uuid::nil(),
             sent_messages: Default::default(),
+            profile_names: Default::default(),
+            profile_requests: Default::default(),
+            contacts: Default::default(),
+            groups: Default::default(),
         }
     }
 }
@@ -125,25 +143,38 @@ impl SignalManager for SignalManagerMock {
 
     fn send_delete_for_me(&self, _channel: &Channel, _message: &Message) {}
 
-    async fn resolve_profile_name(
-        &mut self,
-        _id: Uuid,
-        _profile_key: ProfileKeyBytes,
-    ) -> Option<String> {
+    fn resolve_profile_names(
+        &self,
+        profiles: Vec<(Uuid, ProfileKeyBytes)>,
+    ) -> mpsc::UnboundedReceiver<(Uuid, String)> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let profile_names = self.profile_names.borrow();
+        for (id, _) in profiles {
+            self.profile_requests.borrow_mut().push(id);
+            if let Some(name) = profile_names.get(&id) {
+                let _ = tx.send((id, name.clone()));
+            }
+        }
+        rx
+    }
+
+    async fn profile_key(&self, _id: Uuid) -> Option<ProfileKeyBytes> {
         None
+    }
+
+    async fn request_contacts_sync(&self) -> anyhow::Result<()> {
+        Ok(())
     }
 
     async fn profile_name(&self, _id: Uuid) -> Option<String> {
         None
     }
 
-    async fn contact(&self, _id: Uuid) -> Option<Contact> {
-        None
+    async fn contact(&self, id: Uuid) -> Option<Contact> {
+        self.contacts().await.find(|contact| contact.uuid == id)
     }
 
-    async fn receive_messages(
-        &mut self,
-    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Box<Content>>>>> {
+    async fn receive_messages(&mut self) -> anyhow::Result<Pin<Box<dyn Stream<Item = Received>>>> {
         Ok(Box::pin(tokio_stream::empty()))
     }
 
@@ -151,14 +182,64 @@ impl SignalManager for SignalManagerMock {
         Box::new(Self {
             user_id: self.user_id,
             sent_messages: self.sent_messages.clone(),
+            profile_names: self.profile_names.clone(),
+            profile_requests: self.profile_requests.clone(),
+            contacts: self.contacts.clone(),
+            groups: self.groups.clone(),
         })
     }
 
     async fn contacts(&self) -> Box<dyn Iterator<Item = Contact>> {
-        Box::new(std::iter::empty())
+        let contacts: Vec<_> = self
+            .contacts
+            .borrow()
+            .iter()
+            .map(|(uuid, name)| Contact {
+                uuid: *uuid,
+                phone_number: None,
+                name: name.clone(),
+                verified: Default::default(),
+                profile_key: Default::default(),
+                expire_timer: 0,
+                expire_timer_version: 2,
+                inbox_position: 0,
+                avatar: None,
+            })
+            .collect();
+        Box::new(contacts.into_iter())
     }
 
     async fn groups(&self) -> Box<dyn Iterator<Item = (GroupMasterKeyBytes, Group)>> {
-        Box::new(std::iter::empty())
+        let groups: Vec<_> = self
+            .groups
+            .borrow()
+            .iter()
+            .map(|(master_key_bytes, members)| {
+                let group = Group {
+                    title: "some_group".to_string(),
+                    avatar: Default::default(),
+                    disappearing_messages_timer: None,
+                    access_control: None,
+                    revision: 0,
+                    members: members
+                        .iter()
+                        .map(|&(uuid, profile_key)| Member {
+                            aci: uuid.into(),
+                            role: Role::Default,
+                            profile_key: ProfileKey::create(profile_key),
+                            joined_at_revision: 0,
+                            label: None,
+                            label_emoji: None,
+                        })
+                        .collect(),
+                    pending_members: Default::default(),
+                    requesting_members: Default::default(),
+                    invite_link_password: Default::default(),
+                    description: None,
+                };
+                (*master_key_bytes, group)
+            })
+            .collect();
+        Box::new(groups.into_iter())
     }
 }

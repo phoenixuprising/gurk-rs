@@ -19,7 +19,7 @@ use crate::{config::Config, passphrase::Passphrase};
 
 use self::r#impl::PresageManager;
 pub use self::local_pool::LocalPool;
-pub use self::manager::{Attachment, ResolvedGroup, SignalManager};
+pub use self::manager::{Attachment, Received, ResolvedGroup, SignalManager};
 
 // TODO: these should be either re-exported from presage/libsignal-service
 const PROFILE_KEY_LEN: usize = 32;

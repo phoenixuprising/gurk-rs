@@ -10,7 +10,7 @@ use presage::model::contacts::Contact;
 use presage::model::groups::Group;
 use presage::proto::AttachmentPointer;
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::Stream;
 use uuid::Uuid;
 
@@ -55,21 +55,36 @@ pub trait SignalManager {
 
     async fn profile_name(&self, id: Uuid) -> Option<String>;
 
-    /// Resolves contact name from user's profile via Signal server
-    async fn resolve_profile_name(
-        &mut self,
-        id: Uuid,
-        profile_key: ProfileKeyBytes,
-    ) -> Option<String>;
+    /// Resolves names from users' profiles via Signal server in the background
+    ///
+    /// Profiles are fetched sequentially. Only successfully resolved non-empty names are sent to
+    /// the returned receiver; failures are logged.
+    fn resolve_profile_names(
+        &self,
+        profiles: Vec<(Uuid, ProfileKeyBytes)>,
+    ) -> mpsc::UnboundedReceiver<(Uuid, String)>;
+
+    /// Profile key of a user from the signal storage
+    async fn profile_key(&self, id: Uuid) -> Option<ProfileKeyBytes>;
+
+    /// Requests the primary device to send all its contacts
+    ///
+    /// Contacts are received asynchronously in the messages stream as [`Received::Contacts`].
+    async fn request_contacts_sync(&self) -> anyhow::Result<()>;
 
     async fn contact(&self, id: Uuid) -> Option<Contact>;
 
-    async fn receive_messages(
-        &mut self,
-    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Box<Content>>>>>;
+    async fn receive_messages(&mut self) -> anyhow::Result<Pin<Box<dyn Stream<Item = Received>>>>;
 
     async fn contacts(&self) -> Box<dyn Iterator<Item = Contact>>;
     async fn groups(&self) -> Box<dyn Iterator<Item = (GroupMasterKeyBytes, Group)>>;
+}
+
+/// Item of the incoming messages stream
+pub enum Received {
+    Content(Box<Content>),
+    /// Contacts were synchronized from the primary device and are available in the storage
+    Contacts,
 }
 
 pub struct ResolvedGroup {

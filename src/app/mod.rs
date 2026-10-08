@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::Context as _;
@@ -15,9 +15,9 @@ use crate::data::{Channel, ChannelId, Message, TypingSet};
 use crate::event::Event;
 use crate::input::Input;
 use crate::receipt::ReceiptHandler;
-use crate::signal::{Attachment, SignalManager};
+use crate::signal::{Attachment, ProfileKeyBytes, SignalManager};
 use crate::storage::{MessageId, Storage};
-use crate::util::StatefulList;
+use crate::util::{self, StatefulList};
 use crate::{
     app::channel::ChannelPosition,
     command::{ModeKeybinding, get_keybindings},
@@ -59,6 +59,10 @@ pub struct App {
     event_tx: mpsc::UnboundedSender<Event>,
     // It is expensive to hit the signal manager contacts storage, so we cache it
     names_cache: Cell<Option<BTreeMap<Uuid, String>>>,
+    /// Users whose profile names were requested from the Signal server during this session
+    ///
+    /// Used to avoid requesting the same profile repeatedly, e.g. after a failure.
+    profile_requests: BTreeSet<Uuid>,
     pub mode_keybindings: ModeKeybinding,
     /// When the current channel was selected (for dwell-based timer activation)
     channel_selected_at: std::time::Instant,
@@ -121,6 +125,7 @@ impl App {
             clipboard,
             event_tx,
             names_cache: Default::default(),
+            profile_requests: Default::default(),
             mode_keybindings,
             channel_selected_at: std::time::Instant::now(),
             timers_activated_for: None,
@@ -133,20 +138,118 @@ impl App {
         Ok((app, event_rx))
     }
 
-    /// Resolve and cache all user names for the known user channels
-    pub async fn populate_names_cache(&self) {
-        let mut names_cache = BTreeMap::new();
-        for user_id in self
+    /// Resolve and cache all user names for the known user channels and group members
+    ///
+    /// Users without a known name, but with a known profile key, are resolved from their profiles
+    /// via Signal server in the background.
+    pub async fn populate_names_cache(&mut self) {
+        let user_ids: BTreeSet<Uuid> = self
             .channels()
             .iter()
-            .filter_map(|channel| channel.id.user())
-        {
-            if let Some(name) = self.resolve_name(user_id).await {
-                names_cache.insert(user_id, name);
+            .flat_map(|channel| {
+                channel.id.user().into_iter().chain(
+                    channel
+                        .group_data
+                        .iter()
+                        .flat_map(|group_data| group_data.members.iter().copied()),
+                )
+            })
+            .filter(|&id| id != self.user_id)
+            .collect();
+
+        let mut names_cache = BTreeMap::new();
+        let mut unresolved = Vec::new();
+        for user_id in user_ids {
+            match self.resolve_name(user_id).await {
+                Some(name) => {
+                    if util::is_phone_number(&name) {
+                        unresolved.push(user_id);
+                    }
+                    names_cache.insert(user_id, name);
+                }
+                None => unresolved.push(user_id),
             }
         }
         let mut cache = self.names_cache.take().unwrap_or_default();
         cache.extend(names_cache);
+        self.names_cache.replace(Some(cache));
+
+        if unresolved.is_empty() {
+            return;
+        }
+        let mut group_profile_keys: HashMap<Uuid, ProfileKeyBytes> = HashMap::new();
+        for (_, group) in self.signal_manager.groups().await {
+            for member in group.members {
+                group_profile_keys.insert(member.aci.into(), member.profile_key.bytes);
+            }
+        }
+        let mut profiles = Vec::with_capacity(unresolved.len());
+        for user_id in unresolved {
+            let profile_key = match self.signal_manager.profile_key(user_id).await {
+                Some(profile_key) => Some(profile_key),
+                None => group_profile_keys.get(&user_id).copied(),
+            };
+            if let Some(profile_key) = profile_key {
+                profiles.push((user_id, profile_key));
+            }
+        }
+        self.request_profile_names(profiles);
+    }
+
+    /// Requests names of users from their profiles via Signal server in the background
+    ///
+    /// Each user is requested at most once per session. Resolved names arrive as
+    /// [`Event::ProfileNameResolved`].
+    pub(crate) fn request_profile_names(&mut self, profiles: Vec<(Uuid, ProfileKeyBytes)>) {
+        let profiles: Vec<_> = profiles
+            .into_iter()
+            .filter(|(id, profile_key)| {
+                *id != self.user_id
+                    && profile_key.iter().any(|&b| b != 0)
+                    && self.profile_requests.insert(*id)
+            })
+            .collect();
+        if profiles.is_empty() {
+            return;
+        }
+        debug!(n = profiles.len(), "requesting profile names");
+        let mut names = self.signal_manager.resolve_profile_names(profiles);
+        let tx = self.event_tx.clone();
+        tokio::spawn(async move {
+            while let Some((id, name)) = names.recv().await {
+                if tx.send(Event::ProfileNameResolved { id, name }).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Updates channels and names after contacts were synchronized from the primary device
+    pub async fn on_contacts_synced(&mut self) {
+        for contact in self.signal_manager.contacts().await {
+            let name = contact.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let channel_id = ChannelId::User(contact.uuid);
+            if self.channel(channel_id).is_none() {
+                self.store_channel(Channel {
+                    id: channel_id,
+                    name: name.to_owned(),
+                    group_data: None,
+                    unread_messages: 0,
+                    muted: false,
+                    typing: TypingSet::new(false),
+                    expire_timer: None,
+                });
+            }
+        }
+        self.populate_names_cache().await;
+    }
+
+    fn cache_name(&self, id: Uuid, name: String) {
+        let mut cache = self.names_cache.take().unwrap_or_default();
+        cache.insert(id, name);
         self.names_cache.replace(Some(cache));
     }
 
@@ -238,7 +341,7 @@ impl App {
         if let Some(name) = self
             .storage
             .name(user_id)
-            .filter(|name| !name.trim().is_empty())
+            .filter(|name| !name.trim().is_empty() && Uuid::parse_str(name) != Ok(user_id))
         {
             debug!(%name, "resolved name from storage");
             return Some(name);
@@ -268,9 +371,7 @@ impl App {
         if let Some(name) = name {
             name
         } else if let Some(name) = on_miss(id).await {
-            let mut cache = self.names_cache.take().unwrap_or_default();
-            cache.insert(id, name.clone());
-            self.names_cache.replace(Some(cache));
+            self.cache_name(id, name.clone());
             name
         } else {
             id.to_string()
@@ -313,6 +414,11 @@ impl App {
                     message.send_failed = Some(error.to_string());
                     self.store_message(message_id.channel_id, message);
                 }
+            }
+            Event::ProfileNameResolved { id, name } => {
+                debug!(%id, name, "resolved name from profile");
+                self.storage.store_name(id, &name);
+                self.cache_name(id, name);
             }
         }
         Ok(())
@@ -419,10 +525,19 @@ pub(crate) mod tests {
         mpsc::UnboundedReceiver<Event>,
         Rc<RefCell<Vec<Message>>>,
     ) {
+        test_app_with(SignalManagerMock::new()).await
+    }
+
+    async fn test_app_with(
+        signal_manager: SignalManagerMock,
+    ) -> (
+        App,
+        mpsc::UnboundedReceiver<Event>,
+        Rc<RefCell<Vec<Message>>>,
+    ) {
         let url = "sqlite::memory:".parse().unwrap();
         let mut storage = SqliteStorage::open_unencrypted(&url).await.unwrap();
 
-        let signal_manager = SignalManagerMock::new();
         let sent_messages = signal_manager.sent_messages.clone();
 
         let channel_id = ChannelId::User(Uuid::new_v4());
@@ -498,6 +613,7 @@ pub(crate) mod tests {
                 assert_eq!(message_id.arrived_at, msg.arrived_at);
                 assert!(result.is_ok());
             }
+            event => panic!("unexpected event: {event:?}"),
         }
     }
 
@@ -523,6 +639,7 @@ pub(crate) mod tests {
                 assert_eq!(message_id.arrived_at, msg.arrived_at);
                 assert!(result.is_ok());
             }
+            event => panic!("unexpected event: {event:?}"),
         }
     }
 
@@ -546,6 +663,7 @@ pub(crate) mod tests {
                 assert_eq!(message_id.arrived_at, msg.arrived_at);
                 assert!(result.is_ok());
             }
+            event => panic!("unexpected event: {event:?}"),
         }
     }
 
@@ -643,6 +761,89 @@ pub(crate) mod tests {
             .unwrap()
             .reactions;
         assert!(reactions.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_populate_names_cache_resolves_group_member_profiles() {
+        let member_id = Uuid::new_v4();
+        let master_key_bytes = [1; 32];
+        let profile_key = [2; 32];
+
+        let signal_manager = SignalManagerMock::new();
+        signal_manager
+            .groups
+            .borrow_mut()
+            .push((master_key_bytes, vec![(member_id, profile_key)]));
+        signal_manager
+            .profile_names
+            .borrow_mut()
+            .insert(member_id, "Marla".to_string());
+        let profile_requests = signal_manager.profile_requests.clone();
+
+        let (mut app, mut events, _) = test_app_with(signal_manager).await;
+        app.store_channel(Channel {
+            id: ChannelId::from_master_key_bytes(master_key_bytes).unwrap(),
+            name: "group".to_string(),
+            group_data: Some(GroupData {
+                master_key_bytes,
+                members: vec![app.user_id, member_id],
+                revision: 1,
+            }),
+            unread_messages: 0,
+            muted: false,
+            typing: TypingSet::GroupTyping(Default::default()),
+            expire_timer: None,
+        });
+
+        app.populate_names_cache().await;
+        assert_eq!(app.name_by_id_cached(member_id), member_id.to_string());
+
+        let event = events.recv().await.unwrap();
+        app.handle_event(event).unwrap();
+        assert_eq!(app.name_by_id_cached(member_id), "Marla");
+        assert_eq!(app.storage.name(member_id).as_deref(), Some("Marla"));
+
+        // resolved names are not requested again
+        app.populate_names_cache().await;
+        assert_eq!(*profile_requests.borrow(), [member_id]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_profile_name_is_requested_once() {
+        let user_id = Uuid::new_v4();
+        let signal_manager = SignalManagerMock::new();
+        let profile_requests = signal_manager.profile_requests.clone();
+        let (mut app, _events, _) = test_app_with(signal_manager).await;
+
+        app.ensure_user_is_known(user_id, Some([2; 32])).await;
+        app.ensure_user_is_known(user_id, Some([2; 32])).await;
+        assert_eq!(*profile_requests.borrow(), [user_id]);
+        assert_eq!(app.name_by_id(user_id).await, user_id.to_string());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_uuid_stored_as_name_is_not_resolved() {
+        let user_id = Uuid::new_v4();
+        let (mut app, _events, _) = test_app().await;
+        app.storage.store_name(user_id, &user_id.to_string());
+        assert_eq!(app.resolve_name(user_id).await, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_on_contacts_synced() {
+        let contact_id = Uuid::new_v4();
+        let signal_manager = SignalManagerMock::new();
+        let contacts = signal_manager.contacts.clone();
+        let (mut app, _events, _) = test_app_with(signal_manager).await;
+        assert_eq!(app.name_by_id_cached(contact_id), contact_id.to_string());
+
+        contacts
+            .borrow_mut()
+            .push((contact_id, "Robert Paulson".to_string()));
+        app.on_contacts_synced().await;
+
+        assert!(app.channel(ChannelId::User(contact_id)).is_some());
+        assert_eq!(app.name_by_id_cached(contact_id), "Robert Paulson");
     }
 
     #[test]

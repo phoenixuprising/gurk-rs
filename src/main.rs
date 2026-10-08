@@ -38,6 +38,9 @@ const RECEIPT_TICK_PERIOD: u64 = 144;
 const FRAME_BUDGET: Duration = Duration::from_millis(1000 / TARGET_FPS);
 const SAVE_BUDGET: Duration = Duration::from_millis(1000);
 const RECEIPT_BUDGET: Duration = Duration::from_millis(RECEIPT_TICK_PERIOD * 1000 / TARGET_FPS);
+/// Minimum time between two contacts sync requests (if there are already some contacts)
+const CONTACTS_SYNC_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+const CONTACTS_SYNC_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -138,6 +141,7 @@ pub enum Event {
     Input(KeyEvent),
     Paste(String),
     Message(Box<Content>),
+    ContactsReceived,
     Resize { cols: u16, rows: u16 },
     Quit(Option<anyhow::Error>),
     ContactSynced(DateTime<Utc>),
@@ -172,6 +176,14 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
 
     sync_from_signal(&*signal_manager, &mut *storage).await;
 
+    let has_contacts = signal_manager.contacts().await.next().is_some();
+    let mut request_contacts_sync = relink
+        || !has_contacts
+        || storage
+            .metadata()
+            .contacts_sync_request_at
+            .is_none_or(|at| at + CONTACTS_SYNC_INTERVAL < Utc::now());
+
     let (mut app, mut app_events) = App::try_new(config, signal_manager.clone_boxed(), storage)?;
     app.populate_names_cache().await;
 
@@ -184,6 +196,24 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 continue;
             } else {
+                if request_contacts_sync {
+                    // the contacts are received asynchronously in the messages stream
+                    request_contacts_sync = false;
+                    info!("requesting contacts sync");
+                    match tokio::time::timeout(
+                        CONTACTS_SYNC_TIMEOUT,
+                        signal_manager.request_contacts_sync(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => inner_tx
+                            .send(Event::ContactSynced(Utc::now()))
+                            .await
+                            .expect("logic error: events channel closed"),
+                        Ok(Err(error)) => error!(%error, "failed to request contacts sync"),
+                        Err(_) => error!("timeout requesting contacts sync"),
+                    }
+                }
                 match signal_manager.receive_messages().await {
                     Ok(messages) => {
                         info!("connected and listening for incoming messages");
@@ -204,10 +234,14 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
                 }
             };
 
-            while let Some(message) = messages.next().await {
+            while let Some(received) = messages.next().await {
                 backoff.reset();
+                let event = match received {
+                    signal::Received::Content(content) => Event::Message(content),
+                    signal::Received::Contacts => Event::ContactsReceived,
+                };
                 inner_tx
-                    .send(Event::Message(message))
+                    .send(event)
                     .await
                     .expect("logic error: events channel closed")
             }
@@ -374,6 +408,10 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
                 if let Err(e) = app.on_message(content).await {
                     error!("failed on incoming message: {}", e);
                 }
+            }
+            Some(Event::ContactsReceived) => {
+                info!("received contacts sync");
+                app.on_contacts_synced().await;
             }
             Some(Event::Resize { .. }) | Some(Event::Redraw) => {
                 // will just redraw the app
